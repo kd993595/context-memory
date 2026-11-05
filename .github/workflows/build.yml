@@ -1,0 +1,37 @@
+name: Build macOS Apple Silicon
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*' # Triggers on version tags like v1.0.0
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-mac-arm64:
+    name: Build for macOS (Apple Silicon)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Build Binary
+        env:
+          CGO_ENABLED: 1
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          go build -o mdbrowser-darwin-arm64 -ldflags="-s -w" .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdbrowser-darwin-arm64
+          path: mdbrowser-darwin-arm64
