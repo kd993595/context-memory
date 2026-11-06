@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -192,6 +194,32 @@ func scanRows(res *sql.Rows) ([]table.Row, error) {
 	return rows, res.Err()
 }
 
+// columnPadding is the horizontal space the table adds around each column's
+// text (one cell on each side), so a column of Width w occupies w+2 cells.
+const columnPadding = 2
+
+// tableColumns returns the table layout for a pane paneWidth cells wide. The
+// ID, Date (and, for search results, Score) columns have fixed widths; Subject
+// gets everything that is left, so the row always fills the pane. Without
+// scored the columns are ID, Date, Subject; with it, ID, Date, Score, Subject.
+// Score sits before Subject so a very narrow pane clips the subject text
+// rather than the score.
+func tableColumns(scored bool, paneWidth int) []table.Column {
+	cols := []table.Column{
+		{Title: "ID", Width: 4},
+		{Title: "Date", Width: 11},
+	}
+	if scored {
+		cols = append(cols, table.Column{Title: "Score", Width: 6})
+	}
+	used := 0
+	for _, c := range cols {
+		used += c.Width + columnPadding
+	}
+	subject := max(10, paneWidth-used-columnPadding)
+	return append(cols, table.Column{Title: "Subject", Width: subject})
+}
+
 // loadRows fetches the full list shown in the left table (no content/vector).
 func loadRows(db *sql.DB) ([]table.Row, error) {
 	res, err := db.Query(`SELECT id, date, subject FROM entries ORDER BY date DESC, id DESC`)
@@ -202,18 +230,33 @@ func loadRows(db *sql.DB) ([]table.Row, error) {
 	return scanRows(res)
 }
 
-// searchRows returns the limit entries whose embeddings are closest (by cosine
-// distance) to vec, best match first.
+// searchHit is one search result: an entry plus its cosine similarity to the
+// query (1 = identical direction).
+type searchHit struct {
+	ID         int64
+	Date       string // YYYY-MM-DD
+	Subject    string
+	Similarity float64
+}
+
+// searchHits returns the limit entries whose embeddings are closest (by cosine
+// distance) to vec, best match first, each with its cosine similarity. It is
+// the single implementation of the ranking: the browser shows its results in
+// the table (see searchRows) and the search subcommand prints them as JSON.
 //
 // The query has two parts. The CTE is the exact shape the HNSW optimizer
 // looks for (ORDER BY array_cosine_distance(<indexed column>, <constant
 // vector>) LIMIT n over a single table), so it runs as an index scan over the
 // in-memory searchTable and yields the n nearest ids. Those ids are then
 // joined to the on-disk entries table for date and subject. A join does not
-// preserve the CTE's ordering, so the outer query re-computes the distance for
-// just those n rows to sort the final result. The vector is inlined as a
-// literal; it is generated from float32 values only, never from user text.
-func searchRows(db *sql.DB, vec []float32, limit int) ([]table.Row, error) {
+// preserve the CTE's ordering, so the outer query re-computes the similarity
+// for just those n rows to sort the final result. That same value is selected
+// as the score column, so showing the score costs no extra calculation: it
+// replaces the ORDER BY computation rather than adding to it. Similarity is
+// 1 - cosine distance, so sorting it descending gives the same order as the
+// distance ascending. The vector is inlined as a literal; it is generated from
+// float32 values only, never from user text.
+func searchHits(db *sql.DB, vec []float32, limit int) ([]searchHit, error) {
 	lit := fmt.Sprintf("'%s'::FLOAT[%d]", vectorLiteral(vec), embeddingDim)
 	q := fmt.Sprintf(`
 		WITH hits AS (
@@ -221,18 +264,54 @@ func searchRows(db *sql.DB, vec []float32, limit int) ([]table.Row, error) {
 			ORDER BY array_cosine_distance(embedding, %[2]s)
 			LIMIT %[3]d
 		)
-		SELECT e.id, e.date, e.subject
+		SELECT e.id, e.date, e.subject,
+			array_cosine_similarity(v.embedding, %[2]s) AS score
 		FROM hits h
 		JOIN entries e ON e.id = h.id
 		JOIN %[1]s v ON v.id = h.id
-		ORDER BY array_cosine_distance(v.embedding, %[2]s)`,
+		ORDER BY score DESC`,
 		searchTable, lit, limit)
 	res, err := db.Query(q)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Close()
-	return scanRows(res)
+
+	var hits []searchHit
+	for res.Next() {
+		var (
+			h       searchHit
+			date    sql.NullTime
+			subject sql.NullString
+			score   sql.NullFloat64
+		)
+		if err := res.Scan(&h.ID, &date, &subject, &score); err != nil {
+			return nil, err
+		}
+		if date.Valid {
+			h.Date = date.Time.Format("2006-01-02")
+		}
+		h.Subject = subject.String
+		h.Similarity = score.Float64
+		hits = append(hits, h)
+	}
+	return hits, res.Err()
+}
+
+// searchRows runs searchHits and converts the result into table rows laid out
+// as tableColumns(true, ...): {id, date, score, subject}.
+func searchRows(db *sql.DB, vec []float32, limit int) ([]table.Row, error) {
+	hits, err := searchHits(db, vec, limit)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]table.Row, 0, len(hits))
+	for _, h := range hits {
+		rows = append(rows, table.Row{
+			strconv.FormatInt(h.ID, 10), h.Date, fmt.Sprintf("%.3f", h.Similarity), h.Subject,
+		})
+	}
+	return rows, nil
 }
 
 // searchResultMsg carries the rows for the table after a search (or after
@@ -242,6 +321,9 @@ type searchResultMsg struct {
 	query string
 	rows  []table.Row
 	err   error
+
+	// scored is true when rows carry the similarity column (see tableColumns).
+	scored bool
 }
 
 // searchCmd embeds the query and runs the vector search off the event loop.
@@ -252,7 +334,7 @@ func searchCmd(id int, db *sql.DB, emb *embedder, query string) tea.Cmd {
 			return searchResultMsg{id: id, query: query, err: err}
 		}
 		rows, err := searchRows(db, vec, searchLimit)
-		return searchResultMsg{id: id, query: query, rows: rows, err: err}
+		return searchResultMsg{id: id, query: query, rows: rows, err: err, scored: true}
 	}
 }
 
@@ -400,6 +482,9 @@ type model struct {
 	renderer      *mdRenderer
 	rendererWidth int
 
+	scored    bool // table rows carry the Score column (they are search results)
+	leftWidth int  // inner width of the left pane, used to size the Subject column
+
 	loadedRow int // row whose entry was last requested (-1 = none yet)
 	reqID     int // incremented per request; only the latest result is applied
 
@@ -416,14 +501,8 @@ type model struct {
 const emptyMessage = "\n  No entries yet.\n\n  Add one with:  " + appName + " new -s \"subject\" -t \"content\""
 
 func initialModel(db *sql.DB, rows []table.Row, emb *embedder) model {
-	columns := []table.Column{
-		{Title: "ID", Width: 5},
-		{Title: "Date", Width: 11},
-		{Title: "Subject", Width: 20},
-	}
-
 	t := table.New(
-		table.WithColumns(columns),
+		table.WithColumns(tableColumns(false, 0)), // widened to the pane by resize
 		table.WithRows(rows),
 		table.WithFocused(true),
 	)
@@ -479,6 +558,8 @@ func (m *model) resize() tea.Cmd {
 	leftWidth := m.leftOuter - 2
 	rightWidth := rightOuter - 2
 
+	m.leftWidth = leftWidth
+	m.table.SetColumns(tableColumns(m.scored, m.leftWidth)) // Subject fills the pane
 	m.table.SetWidth(leftWidth)
 	m.table.SetHeight(m.paneHeight)
 
@@ -518,7 +599,7 @@ func (m *model) loadRow(keepOffset, showLoading bool) tea.Cmd {
 		return nil
 	}
 	selected := m.table.SelectedRow()
-	if len(selected) != 3 {
+	if len(selected) == 0 { // the id is always the first cell
 		return nil
 	}
 	entryID, err := strconv.ParseInt(selected[0], 10, 64)
@@ -616,7 +697,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.statusErr = false
-		m.table.SetRows(msg.rows)
+		m.setTableRows(msg.rows, msg.scored)
 		m.table.SetCursor(0)
 		m.loadedRow = -1 // syncSelection below loads the new first row
 		switch {
@@ -649,6 +730,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	cmds = append(cmds, m.syncSelection())
 	return m, tea.Batch(cmds...)
+}
+
+// setTableRows replaces the table contents and switches between the plain and
+// scored column layouts. The table indexes columns by cell position when it
+// renders, so a row must never have more cells than there are columns:
+// the wider layout is installed before the rows, the narrower one after.
+func (m *model) setTableRows(rows []table.Row, scored bool) {
+	m.scored = scored
+	if scored {
+		m.table.SetColumns(tableColumns(true, m.leftWidth))
+		m.table.SetRows(rows)
+		return
+	}
+	m.table.SetRows(rows)
+	m.table.SetColumns(tableColumns(false, m.leftWidth))
 }
 
 // syncSelection loads the selected entry's preview if the cursor moved. The
@@ -790,16 +886,19 @@ func newRootCmd() *cobra.Command {
 		Short: "Browse markdown entries stored in DuckDB",
 		Long: `Browse markdown entries stored in DuckDB.
 
-With no subcommand, starts the interactive browser. Use the new, update and
-load subcommands to add an entry, replace an entry's content, or print an
-entry's content without starting the UI.`,
+With no subcommand, starts the interactive browser. Use the new, update, load
+and search subcommands to add an entry, replace an entry's content, print an
+entry's content, or find the entry closest to a text, without starting the UI.`,
 		Example: `  ` + appName + `
   ` + appName + ` new -s "Meeting notes" -t "# Agenda\n- item one"
   ` + appName + ` new -s "Meeting notes" -f notes.md
   ` + appName + ` update 12 "# New content"
   ` + appName + ` update 12 -f notes.md
   ` + appName + ` load 12
-  ` + appName + ` load 12 -f notes.md`,
+  ` + appName + ` load 12 -f notes.md
+  ` + appName + ` search "meeting notes"
+  ` + appName + ` search "meeting notes" -C
+  ` + appName + ` search "meeting notes" -f result.json`,
 		Args:          cobra.NoArgs, // also makes a mistyped subcommand an error
 		SilenceErrors: true,         // main prints the error itself
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -807,7 +906,7 @@ entry's content without starting the UI.`,
 			return runUI()
 		},
 	}
-	root.AddCommand(newEntryCmd(), updateEntryCmd(), loadEntryCmd())
+	root.AddCommand(newEntryCmd(), updateEntryCmd(), loadEntryCmd(), searchEntryCmd())
 	return root
 }
 
@@ -1027,6 +1126,142 @@ the file receives the content exactly as stored.`,
 	}
 
 	cmd.Flags().StringVarP(&file, "file", "f", "", "write the content to this `file` instead of printing it")
+
+	return cmd
+}
+
+// searchResult is the JSON printed by the search subcommand. Content is a
+// pointer so that it is left out entirely unless requested, while an entry
+// whose content is empty still prints "content": "".
+type searchResult struct {
+	ID         int64   `json:"id"`
+	Date       string  `json:"date"`
+	Subject    string  `json:"subject"`
+	Similarity float64 `json:"similarity"`
+	Content    *string `json:"content,omitempty"`
+}
+
+// marshalSearchResult encodes r as indented JSON with a trailing newline.
+// HTML escaping is off so that <, > and & in subjects and content stay readable.
+func marshalSearchResult(r searchResult) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(r); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// searchEntryCmd is "search": find the single entry whose subject is closest
+// in meaning to a text and print it as JSON.
+func searchEntryCmd() *cobra.Command {
+	var (
+		withContent bool
+		file        string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "search <text> [-C] [-f <file>]",
+		Short: "Print the entry whose subject best matches a text, as JSON",
+		Long: `Find the one entry whose subject is closest in meaning to the given text and
+print it as JSON with the keys id, date, subject and similarity (the cosine
+similarity, 1 = identical direction), then exit without starting the UI. It
+ranks entries exactly as the browser's search does.
+
+With -C/--content the JSON also has a "content" key holding the entry's content
+column. With -f/--file the JSON, including content, is written to that file
+(an existing file is overwritten) and only a confirmation is printed.
+
+Progress messages go to stderr, so stdout is only the JSON. The command fails
+if there are no entries with an embedding to match against.`,
+		Example: `  ` + appName + ` search "meeting notes"
+  ` + appName + ` search "meeting notes" -C
+  ` + appName + ` search "meeting notes" -f result.json`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			text := strings.TrimSpace(strings.Join(args, " "))
+			if text == "" {
+				return fmt.Errorf("search text must not be empty")
+			}
+			fileSet := cmd.Flags().Changed("file")
+			if fileSet && file == "" {
+				return fmt.Errorf("-f/--file needs a filename")
+			}
+
+			cmd.SilenceUsage = true // arguments are valid; runtime errors shouldn't print usage
+
+			ctx, stop := signal.NotifyContext(context.Background(),
+				os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+			defer stop()
+
+			// Same startup as the browser, including the in-memory HNSW index,
+			// so the ranking is the one the browser uses. Progress goes to
+			// stderr to keep stdout clean for the JSON.
+			a, err := setup(ctx, true, func(p progress) {
+				fmt.Fprintf(os.Stderr, "[%d/%d] %s\n", p.Step, p.Total, p.Text)
+			})
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if cerr := a.Close(); cerr != nil {
+					fmt.Fprintf(os.Stderr, "warning: %v\n", cerr)
+				}
+			}()
+			if a.warning != nil {
+				fmt.Fprintf(os.Stderr, "warning: %s\n", oneLine(a.warning.Error()))
+			}
+
+			vec, err := a.emb.Embed(ctx, queryPrefix+text)
+			if err != nil {
+				return err
+			}
+			hits, err := searchHits(a.db, vec, 1)
+			if err != nil {
+				return fmt.Errorf("searching: %w", err)
+			}
+			if len(hits) == 0 {
+				return fmt.Errorf("no entries to search")
+			}
+			hit := hits[0]
+
+			res := searchResult{
+				ID:         hit.ID,
+				Date:       hit.Date,
+				Subject:    hit.Subject,
+				Similarity: hit.Similarity,
+			}
+			// The file always includes the content; stdout only with -C.
+			if withContent || fileSet {
+				content, err := loadContent(a.db, hit.ID)
+				if err != nil {
+					return fmt.Errorf("loading entry %d: %w", hit.ID, err)
+				}
+				res.Content = &content
+			}
+			data, err := marshalSearchResult(res)
+			if err != nil {
+				return fmt.Errorf("encoding JSON: %w", err)
+			}
+
+			out := cmd.OutOrStdout()
+			if fileSet {
+				if err := os.WriteFile(file, data, 0o644); err != nil {
+					return fmt.Errorf("writing %s: %w", file, err)
+				}
+				fmt.Fprintf(out, "Wrote entry %d to %s\n", hit.ID, file)
+				return nil
+			}
+			_, err = out.Write(data)
+			return err
+		},
+	}
+
+	f := cmd.Flags()
+	f.BoolVarP(&withContent, "content", "C", false, "include the entry's content in the JSON as \"content\"")
+	f.StringVarP(&file, "file", "f", "", "write the JSON, including content, to this `file` instead of printing it")
 
 	return cmd
 }

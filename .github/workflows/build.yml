@@ -28,10 +28,10 @@ jobs:
           GOOS: darwin
           GOARCH: arm64
         run: |
-          go build -o mdbrowser-darwin-arm64 -ldflags="-s -w" .
+          go build -o mdmemory-darwin-arm64 -ldflags="-s -w" .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mdbrowser-darwin-arm64
-          path: mdbrowser-darwin-arm64
+          name: mdmemory-darwin-arm64
+          path: mdmemory-darwin-arm64
